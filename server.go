@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/rand"
 	"net"
 	"net/http"
 	"strings"
@@ -73,7 +74,7 @@ const defaultSpanBufferSize = 1 << 14
 type Server struct {
 	Workers     []*Worker
 	EventWorker *EventWorker
-	SpanWorker  *SpanWorker
+	SpanWorkers []*SpanWorker
 
 	Sentry *raven.Client
 
@@ -374,6 +375,12 @@ func NewFromConfig(logger *logrus.Logger, conf Config) (*Server, error) {
 
 			logger.Info("Configured Lightstep trace sink")
 		}
+		// Set up as many span workers as we need:
+		workerCount := 1
+		if conf.NumSpanWorkers > 0 {
+			workerCount = conf.NumSpanWorkers
+		}
+		ret.SpanWorkers = make([]*SpanWorker, workerCount)
 	}
 
 	if conf.KafkaBroker != "" {
@@ -480,13 +487,17 @@ func NewFromConfig(logger *logrus.Logger, conf Config) (*Server, error) {
 func (s *Server) Start() {
 	log.WithField("version", VERSION).Info("Starting server")
 
-	// Set up the processor for spans:
-	s.SpanWorker = NewSpanWorker(s.spanSinks, s.TraceClient)
+	// Set up the processors for spans:
+
+	// Use the pre-allocated Workers slice to know how many to start.
+	for i := range s.SpanWorkers {
+		s.SpanWorkers[i] = NewSpanWorker(s.spanSinks, s.TraceClient)
+	}
 
 	// Now that we have a span worker, set the trace
 	// backend up to send spans to it:
 	if s.traceBackend != nil {
-		s.traceBackend.spanWorker = s.SpanWorker
+		s.traceBackend.spanWorkers = s.SpanWorkers
 		s.traceBackend.tc = s.TraceClient
 	}
 
@@ -498,13 +509,15 @@ func (s *Server) Start() {
 		s.EventWorker.Work()
 	}()
 
-	log.Info("Starting Trace worker")
-	go func() {
-		defer func() {
-			ConsumePanic(s.Sentry, s.TraceClient, s.Hostname, recover())
-		}()
-		s.SpanWorker.Work()
-	}()
+	log.WithField("n", len(s.SpanWorkers)).Info("Starting Trace workers")
+	for i := range s.SpanWorkers {
+		go func(w *SpanWorker) {
+			defer func() {
+				ConsumePanic(s.Sentry, s.TraceClient, s.Hostname, recover())
+			}()
+			w.Work()
+		}(s.SpanWorkers[i])
+	}
 
 	statsdPool := &sync.Pool{
 		// We +1 this so we an "detect" when someone sends us too long of a metric!
@@ -659,6 +672,14 @@ func (s *Server) HandleTracePacket(packet []byte) {
 	s.handleSSF(span, map[string]string{"ssf_format": "packet"})
 }
 
+func spanWorker(span *ssf.SSFSpan, workers []*SpanWorker) *SpanWorker {
+	id := span.Id
+	if id == 0 {
+		id = rand.Int63()
+	}
+	return workers[id%int64(len(workers))]
+}
+
 func (s *Server) handleSSF(span *ssf.SSFSpan, baseTags map[string]string) {
 	tags := map[string]string{}
 	for k, v := range baseTags {
@@ -670,7 +691,7 @@ func (s *Server) handleSSF(span *ssf.SSFSpan, baseTags map[string]string) {
 		ssf.Histogram("ssf.spans.tags_per_span", float32(len(span.Tags)), tags),
 	})
 
-	s.SpanWorker.SpanChan <- span
+	spanWorker(span, s.SpanWorkers).SpanChan <- span
 }
 
 // ReadMetricSocket listens for available packets to handle.
@@ -960,8 +981,8 @@ func (s *Server) getPlugins() []plugins.Plugin {
 }
 
 type internalTraceBackend struct {
-	spanWorker *SpanWorker
-	tc         *trace.Client
+	spanWorkers []*SpanWorker
+	tc          *trace.Client
 }
 
 // Close is a no-op on the internal backend.
@@ -971,12 +992,14 @@ func (tb *internalTraceBackend) Close() error {
 
 // SendSync sends the span directly into the veneur Server.
 func (tb *internalTraceBackend) SendSync(ctx context.Context, span *ssf.SSFSpan) error {
-	if tb.spanWorker == nil {
+	if tb.spanWorkers == nil {
 		return ErrNoSpanWorker
 	}
 	ch := make(chan struct{})
+
+	workerID := span.Id % int64(len(tb.spanWorkers))
 	go func() {
-		tb.spanWorker.SpanChan <- span
+		tb.spanWorkers[workerID].SpanChan <- span
 		close(ch)
 	}()
 	select {

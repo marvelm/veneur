@@ -88,7 +88,8 @@ func generateConfig(forwardAddr string) Config {
 
 		// Use only one reader, so that we can run tests
 		// on platforms which do not support SO_REUSEPORT
-		NumReaders: 1,
+		NumReaders:     1,
+		NumSpanWorkers: 2,
 
 		// Currently this points nowhere, which is intentional.
 		// We don't need internal metrics for the tests, and they make testing
@@ -1172,7 +1173,7 @@ func TestInternalSSFMetricsEndToEnd(t *testing.T) {
 	f := newFixture(t, config, cms, nil)
 	defer f.Close()
 
-	backend := &internalTraceBackend{spanWorker: f.server.SpanWorker}
+	backend := &internalTraceBackend{spanWorkers: f.server.SpanWorkers}
 	client, err := trace.NewBackendClient(backend, trace.Capacity(20))
 	require.NoError(t, err)
 
