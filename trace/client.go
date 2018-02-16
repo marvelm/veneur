@@ -27,6 +27,11 @@ func init() {
 // synchronously, flushing the backend buffer, or closing the backend.
 type op func(context.Context, ClientBackend)
 
+type sendOp struct {
+	span   *ssf.SSFSpan
+	result chan<- error
+}
+
 // Client is a Client that sends traces to Veneur over the network. It
 // represents a pump for span packets from user code to the network
 // (whether it be UDP or streaming sockets, with or without buffers).
@@ -44,7 +49,7 @@ type Client struct {
 	cancel        context.CancelFunc
 	flush         func(context.Context)
 	report        func(context.Context)
-	ops           chan op
+	records       chan *sendOp
 
 	failedFlushes     int64
 	successfulFlushes int64
@@ -57,7 +62,7 @@ type Client struct {
 // any error from closing the connection.
 func (c *Client) Close() error {
 	c.cancel()
-	close(c.ops)
+	close(c.records)
 	return nil
 }
 
@@ -75,39 +80,45 @@ func (c *Client) run(ctx context.Context, ready chan struct{}) {
 		wg.Add(1)
 		switch b := b.(type) {
 		case FlushableClientBackend:
-			go runFlushableBackend(ctx, wg, c.ops, b)
+			go runFlushableBackend(ctx, wg, c.records, b)
 		case ClientBackend:
-			go runBackend(ctx, wg, c.ops, b)
+			go runBackend(ctx, wg, c.records, b)
 		}
 	}
 	close(ready)
 	wg.Wait()
 }
 
-func runBackend(ctx context.Context, wg *sync.WaitGroup, ops chan op, backend ClientBackend) {
+func runBackend(ctx context.Context, wg *sync.WaitGroup, spans chan *sendOp, backend ClientBackend) {
 	defer backend.Close()
 	defer wg.Done()
 	for {
-		do, ok := <-ops
+		op, ok := <-spans
 		if !ok {
 			return
 		}
-		do(ctx, backend)
+		err := backend.SendSync(ctx, op.span)
+		if op.result != nil {
+			op.result <- err
+		}
 	}
 }
 
-func runFlushableBackend(ctx context.Context, wg *sync.WaitGroup, ops chan op, backend FlushableClientBackend) {
+func runFlushableBackend(ctx context.Context, wg *sync.WaitGroup, spans chan *sendOp, backend FlushableClientBackend) {
 	defer backend.Close()
 	defer wg.Done()
 
 	flushChan := backend.FlushChan()
 	for {
 		select {
-		case do, ok := <-ops:
+		case op, ok := <-spans:
 			if !ok {
 				return
 			}
-			do(ctx, backend)
+			err := backend.SendSync(ctx, op.span)
+			if op.result != nil {
+				op.result <- err
+			}
 		case errChan := <-flushChan:
 			errChan <- backend.FlushSync(ctx)
 		}
@@ -300,8 +311,8 @@ func NewClient(addrStr string, opts ...ClientParam) (*Client, error) {
 			return nil, err
 		}
 	}
-	ch := make(chan op, cl.cap)
-	cl.ops = ch
+	ch := make(chan *sendOp, cl.cap)
+	cl.records = ch
 	ctx := context.Background()
 	ctx, cl.cancel = context.WithCancel(ctx)
 
@@ -340,7 +351,7 @@ func NewBackendClient(b ClientBackend, opts ...ClientParam) (*Client, error) {
 			return nil, err
 		}
 	}
-	cl.ops = make(chan op, cl.cap)
+	cl.records = make(chan *sendOp, cl.cap)
 	ctx := context.Background()
 	ctx, cl.cancel = context.WithCancel(ctx)
 
@@ -401,14 +412,9 @@ func Record(cl *Client, span *ssf.SSFSpan, done chan<- error) error {
 		return ErrNoClient
 	}
 
-	op := func(ctx context.Context, s ClientBackend) {
-		err := s.SendSync(ctx, span)
-		if done != nil {
-			done <- err
-		}
-	}
+	op := &sendOp{span: span, result: done}
 	select {
-	case cl.ops <- op:
+	case cl.records <- op:
 		atomic.AddInt64(&cl.successfulRecords, 1)
 		return nil
 	default:
