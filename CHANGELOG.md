@@ -31,6 +31,7 @@
 ** Method `trace.(*Trace).Add`, which allows adding metrics to a trace span.
 * `veneur-proxy` has a new configuration option `forward_timeout` which allows specifying how long forwarding a batch to global veneur servers may take in total. Thanks, [antifuchs](https://github.com/antifuchs)!
 * Add native support for running Veneur within Kubernetes. Thanks, [aditya](https://github.com/chimeracoder)!
+* New config setting `num_span_workers` that allows you to customize the parallelism of span ingestion. Thanks, [antifuchs](https://github.com/antifuchs)!
 
 ## Improvements
 * Updated Datadog span sink to latest version in Datadog tracing agent. Thanks, [gphat](https://github.com/gphat)!
