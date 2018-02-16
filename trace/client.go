@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"sync"
 	"time"
 
 	"sync/atomic"
@@ -36,12 +37,14 @@ type op func(context.Context, ClientBackend)
 // serialization part providing backpressure (the front end) and a
 // backend (which is called on a single goroutine).
 type Client struct {
-	backend ClientBackend
-	cap     uint
-	cancel  context.CancelFunc
-	flush   func(context.Context)
-	report  func(context.Context)
-	ops     chan op
+	backendParams *backendParams
+	backends      []ClientBackend
+	nBackends     uint
+	cap           uint
+	cancel        context.CancelFunc
+	flush         func(context.Context)
+	report        func(context.Context)
+	ops           chan op
 
 	failedFlushes     int64
 	successfulFlushes int64
@@ -53,28 +56,61 @@ type Client struct {
 // closed the network connection (if one was established) and returns
 // any error from closing the connection.
 func (c *Client) Close() error {
-	ch := make(chan error)
 	c.cancel()
-	c.ops <- func(ctx context.Context, s ClientBackend) {
-		ch <- s.Close()
-	}
 	close(c.ops)
-	return <-ch
+	return nil
 }
 
-func (c *Client) run(ctx context.Context) {
+func (c *Client) run(ctx context.Context, ready chan struct{}) {
 	if c.flush != nil {
 		go c.flush(ctx)
 	}
 	if c.report != nil {
 		go c.report(ctx)
 	}
+	wg := &sync.WaitGroup{}
+
+	// This is the right one though:
+	for _, b := range c.backends {
+		wg.Add(1)
+		switch b := b.(type) {
+		case FlushableClientBackend:
+			go runFlushableBackend(ctx, wg, c.ops, b)
+		case ClientBackend:
+			go runBackend(ctx, wg, c.ops, b)
+		}
+	}
+	close(ready)
+	wg.Wait()
+}
+
+func runBackend(ctx context.Context, wg *sync.WaitGroup, ops chan op, backend ClientBackend) {
+	defer backend.Close()
+	defer wg.Done()
 	for {
-		do, ok := <-c.ops
+		do, ok := <-ops
 		if !ok {
 			return
 		}
-		do(ctx, c.backend)
+		do(ctx, backend)
+	}
+}
+
+func runFlushableBackend(ctx context.Context, wg *sync.WaitGroup, ops chan op, backend FlushableClientBackend) {
+	defer backend.Close()
+	defer wg.Done()
+
+	flushChan := backend.FlushChan()
+	for {
+		select {
+		case do, ok := <-ops:
+			if !ok {
+				return
+			}
+			do(ctx, backend)
+		case errChan := <-flushChan:
+			errChan <- backend.FlushSync(ctx)
+		}
 	}
 }
 
@@ -123,8 +159,8 @@ func Buffered(cl *Client) error {
 // buffer.
 func BufferedSize(size uint) ClientParam {
 	return func(cl *Client) error {
-		if nb, ok := cl.backend.(networkBackend); ok {
-			nb.params().bufferSize = size
+		if cl.backendParams != nil {
+			cl.backendParams.bufferSize = size
 			return nil
 		}
 		return ErrClientNotNetworked
@@ -152,7 +188,7 @@ func FlushInterval(interval time.Duration) ClientParam {
 // time.Ticker is set up to deal with slow flushes.
 func FlushChannel(ch <-chan time.Time, stop func()) ClientParam {
 	return func(cl *Client) error {
-		if _, ok := cl.backend.(networkBackend); !ok {
+		if cl.backendParams == nil {
 			return ErrClientNotNetworked
 		}
 		cl.flush = func(ctx context.Context) {
@@ -175,8 +211,8 @@ func FlushChannel(ch <-chan time.Time, stop func()) ClientParam {
 // this option is not used, the backend uses DefaultBackoff.
 func BackoffTime(t time.Duration) ClientParam {
 	return func(cl *Client) error {
-		if nb, ok := cl.backend.(networkBackend); ok {
-			nb.params().backoff = t
+		if cl.backendParams != nil {
+			cl.backendParams.backoff = t
 			return nil
 		}
 		return ErrClientNotNetworked
@@ -188,8 +224,8 @@ func BackoffTime(t time.Duration) ClientParam {
 // DefaultMaxBackoff.
 func MaxBackoffTime(t time.Duration) ClientParam {
 	return func(cl *Client) error {
-		if nb, ok := cl.backend.(networkBackend); ok {
-			nb.params().maxBackoff = t
+		if cl.backendParams != nil {
+			cl.backendParams.maxBackoff = t
 			return nil
 		}
 		return ErrClientNotNetworked
@@ -204,8 +240,8 @@ func MaxBackoffTime(t time.Duration) ClientParam {
 // DefaultConnectTimeout.
 func ConnectTimeout(t time.Duration) ClientParam {
 	return func(cl *Client) error {
-		if nb, ok := cl.backend.(networkBackend); ok {
-			nb.params().connectTimeout = t
+		if cl.backendParams != nil {
+			cl.backendParams.connectTimeout = t
 			return nil
 		}
 		return ErrClientNotNetworked
@@ -233,6 +269,19 @@ func ReportStatistics(stats *statsd.Client, interval time.Duration, tags []strin
 	}
 }
 
+// ParallelBackends sets the number of parallel network backend
+// connections to send spans with. Each backend holds a connection to
+// an SSF receiver open.
+func ParallelBackends(nBackends uint) ClientParam {
+	return func(cl *Client) error {
+		if cl.backendParams == nil {
+			return ErrClientNotNetworked
+		}
+		cl.nBackends = nBackends
+		return nil
+	}
+}
+
 // NewClient constructs a new client that will attempt to connect
 // to addrStr (an address in veneur URL format) using the parameters
 // in opts. It returns the constructed client or an error.
@@ -242,19 +291,10 @@ func NewClient(addrStr string, opts ...ClientParam) (*Client, error) {
 		return nil, err
 	}
 	cl := &Client{}
-	var nb networkBackend
-	switch addr := addr.(type) {
-	case *net.UDPAddr:
-		nb = &packetBackend{}
-	case *net.UnixAddr:
-		nb = &streamBackend{}
-	default:
-		return nil, fmt.Errorf("can not connect to %v addresses", addr.Network())
-	}
-	cl.backend = nb
-	params := nb.params()
-	params.addr = addr
+	cl.backendParams = &backendParams{}
+	cl.backendParams.addr = addr
 	cl.cap = DefaultCapacity
+	cl.nBackends = DefaultParallelism
 	for _, opt := range opts {
 		if err = opt(cl); err != nil {
 			return nil, err
@@ -264,7 +304,24 @@ func NewClient(addrStr string, opts ...ClientParam) (*Client, error) {
 	cl.ops = ch
 	ctx := context.Background()
 	ctx, cl.cancel = context.WithCancel(ctx)
-	go cl.run(ctx)
+
+	var nb []ClientBackend
+	for i := uint(0); i < cl.nBackends; i++ {
+		switch addr := addr.(type) {
+		case *net.UDPAddr:
+			nb = append(nb, &packetBackend{backendParams: *cl.backendParams})
+		case *net.UnixAddr:
+			flushChan := make(chan chan<- error)
+			nb = append(nb, &streamBackend{backendParams: *cl.backendParams, flushChan: flushChan})
+		default:
+			return nil, fmt.Errorf("can not connect to %v addresses", addr.Network())
+		}
+	}
+	cl.backends = nb
+	ready := make(chan struct{})
+	go cl.run(ctx, ready)
+	<-ready
+
 	return cl, nil
 }
 
@@ -275,7 +332,7 @@ func NewClient(addrStr string, opts ...ClientParam) (*Client, error) {
 // trips over the network.
 func NewBackendClient(b ClientBackend, opts ...ClientParam) (*Client, error) {
 	cl := &Client{}
-	cl.backend = b
+	cl.backends = []ClientBackend{b}
 	cl.cap = 1
 
 	for _, opt := range opts {
@@ -286,7 +343,11 @@ func NewBackendClient(b ClientBackend, opts ...ClientParam) (*Client, error) {
 	cl.ops = make(chan op, cl.cap)
 	ctx := context.Background()
 	ctx, cl.cancel = context.WithCancel(ctx)
-	go cl.run(ctx)
+
+	ready := make(chan struct{})
+	go cl.run(ctx, ready)
+	<-ready
+
 	return cl, nil
 }
 
@@ -301,6 +362,10 @@ var DefaultClient *Client
 // DefaultCapacity is the capacity of the span submission queue in a
 // veneur client.
 const DefaultCapacity = 64
+
+// DefaultParallelism is the number of span submission goroutines a
+// veneur client runs in parallel.
+const DefaultParallelism = 8
 
 // DefaultVeneurAddress is the address that a reasonable veneur should
 // listen on. Currently it defaults to UDP port 8128.
@@ -369,29 +434,48 @@ func Flush(cl *Client) error {
 	return <-ch
 }
 
+// FlushError is an aggregate error type indicating that one or more
+// backends failed to flush.
+type FlushError struct {
+	Errors []error
+}
+
+func (fe *FlushError) Error() string {
+	return fmt.Sprintf("Errors encountered flushing backends: %v", fe.Errors)
+}
+
 // FlushAsync instructs a buffered client to flush to the upstream
 // veneur all the spans that were serialized up until the moment that
 // the flush was received. Once the client has completed the flush,
 // any error (or nil) is sent down the error channel.
 //
-// FlushAsync returns ErrNoClient if client is nil and ErrWouldBlock
-// if the client is not able to take more requests.
+// FlushAsync returns ErrNoClient if client is nil.
 func FlushAsync(cl *Client, ch chan<- error) error {
 	if cl == nil {
 		return ErrNoClient
 	}
-	op := func(ctx context.Context, s ClientBackend) {
-		err := s.FlushSync(ctx)
-		if ch != nil {
-			ch <- err
+	go func() {
+		errors := []error{}
+		oneCh := make(chan error)
+		for _, b := range cl.backends {
+			if b, ok := b.(FlushableClientBackend); ok {
+				select {
+				case b.FlushChan() <- oneCh:
+					if err := <-oneCh; err != nil {
+						errors = append(errors, err)
+					}
+				default:
+					errors = append(errors, ErrWouldBlock)
+				}
+			}
 		}
-	}
-	select {
-	case cl.ops <- op:
+		if len(errors) > 0 {
+			atomic.AddInt64(&cl.failedFlushes, 1)
+			ch <- &FlushError{errors}
+			return
+		}
 		atomic.AddInt64(&cl.successfulFlushes, 1)
-		return nil
-	default:
-	}
-	atomic.AddInt64(&cl.failedFlushes, 1)
-	return ErrWouldBlock
+		ch <- nil
+	}()
+	return nil
 }

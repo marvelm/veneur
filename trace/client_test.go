@@ -118,6 +118,7 @@ func TestUNIXBuffered(t *testing.T) {
 
 	client, err := NewClient((&url.URL{Scheme: "unix", Path: sockName}).String(),
 		Capacity(4),
+		ParallelBackends(1),
 		Buffered)
 	require.NoError(t, err)
 	defer client.Close()
@@ -272,7 +273,10 @@ func TestReconnectUNIX(t *testing.T) {
 	})
 	defer cleanup()
 
-	client, err := NewClient((&url.URL{Scheme: "unix", Path: sockName}).String(), Capacity(4))
+	client, err := NewClient((&url.URL{Scheme: "unix", Path: sockName}).String(),
+		Capacity(4),
+		ParallelBackends(1),
+	)
 	require.NoError(t, err)
 	defer client.Close()
 
@@ -342,6 +346,7 @@ func TestReconnectBufferedUNIX(t *testing.T) {
 
 	client, err := NewClient((&url.URL{Scheme: "unix", Path: sockName}).String(),
 		Capacity(4),
+		ParallelBackends(1),
 		Buffered)
 	require.NoError(t, err)
 	defer client.Close()
@@ -449,8 +454,9 @@ func TestInternalBackend(t *testing.T) {
 }
 
 type successTestBackend struct {
-	t     *testing.T
-	block chan func()
+	t         *testing.T
+	block     chan chan struct{}
+	flushChan chan chan<- error
 }
 
 func (tb *successTestBackend) Close() error {
@@ -461,8 +467,8 @@ func (tb *successTestBackend) Close() error {
 func (tb *successTestBackend) SendSync(ctx context.Context, span *ssf.SSFSpan) error {
 	tb.t.Logf("Sending span")
 	select {
-	case fun := <-tb.block:
-		fun()
+	case block := <-tb.block:
+		<-block
 	default:
 	}
 	return nil
@@ -471,16 +477,22 @@ func (tb *successTestBackend) SendSync(ctx context.Context, span *ssf.SSFSpan) e
 func (tb *successTestBackend) FlushSync(ctx context.Context) error {
 	tb.t.Logf("flushing")
 	select {
-	case fun := <-tb.block:
-		fun()
+	case block := <-tb.block:
+		<-block
 	default:
 	}
 	return nil
 }
 
+func (tb *successTestBackend) FlushChan() chan chan<- error {
+	return tb.flushChan
+}
+
 func TestDropStatistics(t *testing.T) {
-	blockNext := make(chan func(), 1)
-	tb := successTestBackend{t, blockNext}
+	blockNext := make(chan chan struct{}, 1)
+	flushChan := make(chan chan<- error)
+	defer close(flushChan)
+	tb := successTestBackend{t: t, block: blockNext, flushChan: flushChan}
 
 	// Make a client that blocks if nothing listens:
 	cl, err := NewBackendClient(&tb, Capacity(0))
@@ -491,10 +503,6 @@ func TestDropStatistics(t *testing.T) {
 		return tr.ClientRecord(cl, "hi there", map[string]string{})
 	}
 
-	for err = Flush(cl); err != nil; err = Flush(cl) {
-		// Wait until the client is ready (this can take a few
-		// cycles, as the goroutine to read ops must spin up)
-	}
 	// reset client stats:
 	stats, err := statsd.NewBuffered("127.0.0.1:8200", 4096)
 	require.NoError(t, err)
@@ -506,9 +514,7 @@ func TestDropStatistics(t *testing.T) {
 	assert.Equal(t, int64(1), cl.successfulFlushes, "successful flushes")
 
 	done := make(chan struct{})
-	blockNext <- func() {
-		<-done
-	}
+	blockNext <- done
 	err = somespan()
 	assert.NoError(t, err, "Sending an expected metric should succeed")
 	assert.Equal(t, int64(1), cl.successfulRecords, "successful records")
@@ -519,8 +525,6 @@ func TestDropStatistics(t *testing.T) {
 	assert.Equal(t, int64(1), cl.failedRecords, "failed records")
 
 	err = Flush(cl)
-	assert.Error(t, err)
-	assert.Equal(t, ErrWouldBlock, err, "Expected to report a blocked channel")
 	assert.Equal(t, int64(1), cl.failedFlushes, "failed flushes")
 	close(done)
 	close(blockNext)

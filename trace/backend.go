@@ -57,6 +57,18 @@ type ClientBackend interface {
 	// encounters any non-protocol errors (e.g. in serializing the
 	// SSF span), it must return them without reconnecting.
 	SendSync(ctx context.Context, span *ssf.SSFSpan) error
+}
+
+// FlushableClientBackend represents the ability of a client to flush
+// any buffered SSF spans over to a veneur server.
+type FlushableClientBackend interface {
+	ClientBackend
+
+	// FlushChan returns a channel that can be used by the Client
+	// to tell the backend that it needs to flush now. When
+	// triggering each flush, any error from flushing the backend
+	// is passed back via the chan error.
+	FlushChan() chan chan<- error
 
 	// FlushSync causes all (potentially) buffered data to be sent to
 	// the upstream veneur.
@@ -116,19 +128,15 @@ func (s *packetBackend) SendSync(ctx context.Context, span *ssf.SSFSpan) error {
 	return err
 }
 
-// FlushSync on a PacketStream is a no-op.
-func (s *packetBackend) FlushSync(context.Context) error {
-	return nil
-}
-
 var _ networkBackend = &packetBackend{}
 
 // streamBackend is a backend for streaming connections.
 type streamBackend struct {
 	backendParams
-	conn   net.Conn
-	output io.Writer
-	buffer *bufio.Writer
+	conn      net.Conn
+	output    io.Writer
+	buffer    *bufio.Writer
+	flushChan chan chan<- error
 }
 
 func connect(ctx context.Context, s networkBackend) error {
@@ -214,7 +222,7 @@ func (ds *streamBackend) Close() error {
 	return ds.conn.Close()
 }
 
-// FlushSync on a DirectStream flushes the buffer if one exists. If the
+// FlushSync on a streamBackend flushes the buffer if one exists. If the
 // connection was disconnected prior to flushing, FlushSync re-establishes
 // it and discards the buffer.
 func (ds *streamBackend) FlushSync(ctx context.Context) error {
@@ -234,6 +242,10 @@ func (ds *streamBackend) FlushSync(ctx context.Context) error {
 		ds.conn = nil
 	}
 	return err
+}
+
+func (ds *streamBackend) FlushChan() chan chan<- error {
+	return ds.flushChan
 }
 
 var _ networkBackend = &streamBackend{}
