@@ -64,12 +64,6 @@ type ClientBackend interface {
 type FlushableClientBackend interface {
 	ClientBackend
 
-	// FlushChan returns a channel that can be used by the Client
-	// to tell the backend that it needs to flush now. When
-	// triggering each flush, any error from flushing the backend
-	// is passed back via the chan error.
-	FlushChan() chan chan<- error
-
 	// FlushSync causes all (potentially) buffered data to be sent to
 	// the upstream veneur.
 	FlushSync(ctx context.Context) error
@@ -133,10 +127,9 @@ var _ networkBackend = &packetBackend{}
 // streamBackend is a backend for streaming connections.
 type streamBackend struct {
 	backendParams
-	conn      net.Conn
-	output    io.Writer
-	buffer    *bufio.Writer
-	flushChan chan chan<- error
+	conn   net.Conn
+	output io.Writer
+	buffer *bufio.Writer
 }
 
 func connect(ctx context.Context, s networkBackend) error {
@@ -242,10 +235,6 @@ func (ds *streamBackend) FlushSync(ctx context.Context) error {
 		ds.conn = nil
 	}
 	return err
-}
-
-func (ds *streamBackend) FlushChan() chan chan<- error {
-	return ds.flushChan
 }
 
 var _ networkBackend = &streamBackend{}

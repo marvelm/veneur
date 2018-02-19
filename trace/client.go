@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"net"
-	"sync"
 	"time"
 
 	"sync/atomic"
@@ -32,6 +31,11 @@ type sendOp struct {
 	result chan<- error
 }
 
+type flushBackend struct {
+	backend ClientBackend
+	notify  chan chan<- error
+}
+
 // Client is a Client that sends traces to Veneur over the network. It
 // represents a pump for span packets from user code to the network
 // (whether it be UDP or streaming sockets, with or without buffers).
@@ -42,8 +46,11 @@ type sendOp struct {
 // serialization part providing backpressure (the front end) and a
 // backend (which is called on a single goroutine).
 type Client struct {
+	flushBackends []flushBackend
+
+	// Parameters adjusted by initialization / used to build a
+	// running client:
 	backendParams *backendParams
-	backends      []ClientBackend
 	nBackends     uint
 	cap           uint
 	cancel        context.CancelFunc
@@ -51,6 +58,7 @@ type Client struct {
 	report        func(context.Context)
 	records       chan *sendOp
 
+	// statistics:
 	failedFlushes     int64
 	successfulFlushes int64
 	failedRecords     int64
@@ -66,49 +74,21 @@ func (c *Client) Close() error {
 	return nil
 }
 
-func (c *Client) run(ctx context.Context, ready chan struct{}) {
+func (c *Client) run(ctx context.Context) {
 	if c.flush != nil {
 		go c.flush(ctx)
 	}
 	if c.report != nil {
 		go c.report(ctx)
 	}
-	wg := &sync.WaitGroup{}
 
-	// This is the right one though:
-	for _, b := range c.backends {
-		wg.Add(1)
-		switch b := b.(type) {
-		case FlushableClientBackend:
-			go runFlushableBackend(ctx, wg, c.records, b)
-		case ClientBackend:
-			go runBackend(ctx, wg, c.records, b)
-		}
-	}
-	close(ready)
-	wg.Wait()
-}
-
-func runBackend(ctx context.Context, wg *sync.WaitGroup, spans chan *sendOp, backend ClientBackend) {
-	defer backend.Close()
-	defer wg.Done()
-	for {
-		op, ok := <-spans
-		if !ok {
-			return
-		}
-		err := backend.SendSync(ctx, op.span)
-		if op.result != nil {
-			op.result <- err
-		}
+	for _, b := range c.flushBackends {
+		go runFlushableBackend(ctx, c.records, b.backend, b.notify)
 	}
 }
 
-func runFlushableBackend(ctx context.Context, wg *sync.WaitGroup, spans chan *sendOp, backend FlushableClientBackend) {
+func runFlushableBackend(ctx context.Context, spans chan *sendOp, backend ClientBackend, flushNotify chan chan<- error) {
 	defer backend.Close()
-	defer wg.Done()
-
-	flushChan := backend.FlushChan()
 	for {
 		select {
 		case op, ok := <-spans:
@@ -119,8 +99,13 @@ func runFlushableBackend(ctx context.Context, wg *sync.WaitGroup, spans chan *se
 			if op.result != nil {
 				op.result <- err
 			}
-		case errChan := <-flushChan:
-			errChan <- backend.FlushSync(ctx)
+		case errChan := <-flushNotify:
+			switch backend := backend.(type) {
+			case FlushableClientBackend:
+				errChan <- backend.FlushSync(ctx)
+			default:
+				errChan <- nil
+			}
 		}
 	}
 }
@@ -293,6 +278,14 @@ func ParallelBackends(nBackends uint) ClientParam {
 	}
 }
 
+func newFlushBackend(backend ClientBackend) flushBackend {
+	fb := flushBackend{backend: backend}
+	if _, ok := backend.(FlushableClientBackend); ok {
+		fb.notify = make(chan chan<- error)
+	}
+	return fb
+}
+
 // NewClient constructs a new client that will attempt to connect
 // to addrStr (an address in veneur URL format) using the parameters
 // in opts. It returns the constructed client or an error.
@@ -316,22 +309,21 @@ func NewClient(addrStr string, opts ...ClientParam) (*Client, error) {
 	ctx := context.Background()
 	ctx, cl.cancel = context.WithCancel(ctx)
 
-	var nb []ClientBackend
+	fb := []flushBackend{}
 	for i := uint(0); i < cl.nBackends; i++ {
 		switch addr := addr.(type) {
 		case *net.UDPAddr:
-			nb = append(nb, &packetBackend{backendParams: *cl.backendParams})
+			be := &packetBackend{backendParams: *cl.backendParams}
+			fb = append(fb, newFlushBackend(be))
 		case *net.UnixAddr:
-			flushChan := make(chan chan<- error)
-			nb = append(nb, &streamBackend{backendParams: *cl.backendParams, flushChan: flushChan})
+			be := &streamBackend{backendParams: *cl.backendParams}
+			fb = append(fb, newFlushBackend(be))
 		default:
 			return nil, fmt.Errorf("can not connect to %v addresses", addr.Network())
 		}
 	}
-	cl.backends = nb
-	ready := make(chan struct{})
-	go cl.run(ctx, ready)
-	<-ready
+	cl.flushBackends = fb
+	cl.run(ctx)
 
 	return cl, nil
 }
@@ -343,7 +335,7 @@ func NewClient(addrStr string, opts ...ClientParam) (*Client, error) {
 // trips over the network.
 func NewBackendClient(b ClientBackend, opts ...ClientParam) (*Client, error) {
 	cl := &Client{}
-	cl.backends = []ClientBackend{b}
+	cl.flushBackends = []flushBackend{newFlushBackend(b)}
 	cl.cap = 1
 
 	for _, opt := range opts {
@@ -355,10 +347,7 @@ func NewBackendClient(b ClientBackend, opts ...ClientParam) (*Client, error) {
 	ctx := context.Background()
 	ctx, cl.cancel = context.WithCancel(ctx)
 
-	ready := make(chan struct{})
-	go cl.run(ctx, ready)
-	<-ready
-
+	go cl.run(ctx)
 	return cl, nil
 }
 
@@ -463,16 +452,17 @@ func FlushAsync(cl *Client, ch chan<- error) error {
 	go func() {
 		errors := []error{}
 		oneCh := make(chan error)
-		for _, b := range cl.backends {
-			if b, ok := b.(FlushableClientBackend); ok {
-				select {
-				case b.FlushChan() <- oneCh:
-					if err := <-oneCh; err != nil {
-						errors = append(errors, err)
-					}
-				default:
-					errors = append(errors, ErrWouldBlock)
+		for _, fb := range cl.flushBackends {
+			if fb.notify == nil {
+				continue
+			}
+			select {
+			case fb.notify <- oneCh:
+				if err := <-oneCh; err != nil {
+					errors = append(errors, err)
 				}
+			default:
+				errors = append(errors, ErrWouldBlock)
 			}
 		}
 		if len(errors) > 0 {
