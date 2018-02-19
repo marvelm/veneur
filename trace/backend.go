@@ -26,8 +26,8 @@ const DefaultMaxBackoff = 1 * time.Second
 // the span is discarded.
 const DefaultConnectTimeout = 10 * time.Second
 
-// BufferSize is the default size of the SSF buffer. It defaults to
-// enough bytes to accomodate the largest SSF span.
+// BufferSize is the default size of the SSF buffer per connection. It
+// defaults to enough bytes to accomodate the largest SSF span.
 const BufferSize int = int(protocol.MaxSSFPacketLength + protocol.SSFFrameLength)
 
 type backendParams struct {
